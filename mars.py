@@ -1,18 +1,21 @@
 import math
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from PIL import Image
+import os
 import sys
 import time
-import os
-from numba import njit, prange
+from PIL import Image
+import matplotlib.pyplot as plt
+from numba import njit
+
+# Set MPLCONFIGDIR to a writable directory
+os.environ["MPLCONFIGDIR"] = "/tmp"
+matplotlib.use('Agg')
 
 # -----------------------------------------------------------------------------------------
-# Physically realistic simulation of a 37,000 km space elevator collapse on Mars.
-# Starting from stable configuration (cable along x-axis, rotating with Mars),
-# at t=0 we "cut" the top anchor.
+# Simulation of a 37,000 km space elevator collapse on Mars.
+#
+# Run until top node touches planet surface or max_steps reached.
 # -----------------------------------------------------------------------------------------
 
 GM = 4.282837e13
@@ -21,10 +24,11 @@ J2 = 0.00196045
 omega_mars = 7.088218e-05
 M_mars = GM / 6.67430e-11
 
-L = 3.7e7
+L = 3.7e7     # 37000 km
 rho_cable = 1300.0
 A = 1e-4
-E = 3.5e11
+# Lower E significantly for stability
+E = 1e9
 Cd = 1.0
 
 rho0_atm = 0.02
@@ -33,17 +37,26 @@ H_atm = 11100.0
 N = 1000
 segment_length = L/N
 m = rho_cable*A*segment_length
-damping_alpha = 1e-4
 
-dt = 0.1
-Tfinal = 3600.0
-num_steps = int(Tfinal/dt)
+# High damping
+damping_alpha = 0.1
 
-print("Using parallel numba if possible.")
-print(f"N={N}, segment_length={segment_length} m, mass per node={m} kg")
-print(f"dt={dt} s, total_steps={num_steps}")
-print("Starting from stable elevator configuration (straight line, rotating with planet).")
-print("Then cut top at t=0, watch collapse.")
+# dt slightly larger than tiny, but still small
+dt = 0.005
+
+max_steps = 50_000_000  # large max steps
+
+# Long anchor removal period
+anchor_removal_time = 100.0
+anchor_strength = E*A*10.0  # smaller anchor strength to avoid huge forces
+
+save_interval = 10000
+max_frames = 2000
+
+print("No fenics, no MPI, no ffmpeg.")
+print(f"N={N}, segment_length={segment_length}m, mass/node={m}kg")
+print(f"dt={dt}s. Running until top node hits surface or max_steps={max_steps}.")
+print("Lower E, higher damping, longer anchor removal for stability.")
 sys.stdout.flush()
 
 @njit(fastmath=True)
@@ -67,11 +80,12 @@ def atmosphere_density(pos0,pos1,pos2):
         return rho0_atm
     return rho0_atm*math.exp(-alt/H_atm)
 
-@njit(parallel=True, fastmath=True)
-def compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars):
+@njit(fastmath=True)
+def compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars,
+                   X_top_init, anchor_strength, anchor_removal_time, t):
     F = np.zeros((N+1,3), dtype=np.float64)
     # Tension
-    for i in prange(N):
+    for i in range(N):
         dx0 = X[i+1,0]-X[i,0]
         dx1 = X[i+1,1]-X[i,1]
         dx2 = X[i+1,2]-X[i,2]
@@ -90,13 +104,14 @@ def compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars):
         F[i+1,2] -= T*t2
 
     # Gravity, drag, damping
-    for i in prange(N+1):
+    for i in range(N+1):
         pos0 = X[i,0]
         pos1 = X[i,1]
         pos2 = X[i,2]
         vel0 = V[i,0]
         vel1 = V[i,1]
         vel2 = V[i,2]
+
         gx,gy,gz = gravity_j2(pos0,pos1,pos2)
         F[i,0]+=m*gx
         F[i,1]+=m*gy
@@ -118,9 +133,19 @@ def compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars):
         F[i,1]+=-damping_alpha*m*vel1
         F[i,2]+=-damping_alpha*m*vel2
 
+    # Gradual anchor removal at top node
+    if t < anchor_removal_time:
+        scale = 1.0 - t/anchor_removal_time
+        ax0 = X[N,0]-X_top_init[0]
+        ax1 = X[N,1]-X_top_init[1]
+        ax2 = X[N,2]-X_top_init[2]
+        F[N,0] += -anchor_strength*ax0*scale
+        F[N,1] += -anchor_strength*ax1*scale
+        F[N,2] += -anchor_strength*ax2*scale
+
     return F
 
-# Initial conditions: stable configuration
+# Initial conditions:
 X = np.zeros((N+1,3), dtype=np.float64)
 for i in range(N+1):
     X[i,0] = R_mars + i*segment_length
@@ -129,73 +154,74 @@ for i in range(N+1):
     x_pos = X[i,0]
     V[i,1] = omega_mars*x_pos
 
-print("Initial condition set: stable elevator configuration with top anchored.")
-print("At t=0, we assume top anchor suddenly removed. The cable will collapse realistically.")
+X_top_init = X[-1].copy()
+
+print("Initial stable config set. Will remove anchor gradually over 100s.")
 sys.stdout.flush()
 
-# Warm-up JIT
-print("Warming up JIT (compute_forces) to avoid long initial stall...")
-dummy_F = compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars)
-print("JIT warm-up done. Starting simulation now...")
+print("Warming up JIT...")
+F_dummy = compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars,X_top_init,anchor_strength,anchor_removal_time,0.0)
+print("JIT warm-up done.")
 sys.stdout.flush()
 
-save_interval = 100
-frames_count = num_steps//save_interval+1
-positions_saved = np.zeros((frames_count, N+1,3), dtype=np.float64)
-positions_saved[0,:,:] = X.copy()
+positions_saved = []
+positions_saved.append(X.copy())
 
 if not os.path.exists('frames'):
     os.makedirs('frames')
 
-print("Starting dynamic simulation...")
-sys.stdout.flush()
 start_time = time.time()
-step_print_interval = max(num_steps//10,1)
-frame_idx = 1
+frames_saved = 1
 
-for step in range(num_steps):
-    if step % step_print_interval == 0:
-        elapsed = time.time()-start_time
-        perc = (step/num_steps)*100
-        est_total = elapsed/(perc+1e-30)*100 if perc>0 else 0
-        est_rem = est_total - elapsed if perc>0 else 0
-        print(f"Step {step}/{num_steps} ({perc:.1f}%): Elapsed={elapsed:.2f}s, Est.Rem={est_rem:.2f}s")
-        sys.stdout.flush()
-
-    F_now = compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars)
+for step in range(max_steps):
+    t = step*dt
+    F_now = compute_forces(X,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars,X_top_init,anchor_strength,anchor_removal_time,t)
     X_new = X + dt*V + (dt**2/(2*m))*F_now
-    F_new = compute_forces(X_new,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars)
+    F_new = compute_forces(X_new,V,N,m,E,A,segment_length,Cd,damping_alpha,omega_mars,X_top_init,anchor_strength,anchor_removal_time,t)
     V_new = V + (dt/(2*m))*(F_now+F_new)
 
     X = X_new
     V = V_new
 
-    if step % save_interval == 0 and step>0:
-        positions_saved[frame_idx,:,:] = X.copy()
-        frame_idx += 1
+    pos_top = X[N]
+    r_top = math.sqrt(pos_top[0]**2+pos_top[1]**2+pos_top[2]**2)
+    if r_top <= R_mars:
+        print(f"Top node hit surface at step={step}, r_top={r_top:.2f}. Done.")
         sys.stdout.flush()
+        break
 
     if np.isnan(X).any() or np.isnan(V).any():
-        print("WARNING: NaN encountered! Stopping.")
+        print("NaN encountered, stopping.")
         sys.stdout.flush()
         break
     if np.abs(X).max()>1e12 or np.abs(V).max()>1e9:
-        print("WARNING: Extreme values encountered. Stopping.")
+        print("Extreme values encountered, stopping.")
         sys.stdout.flush()
         break
 
+    # Save frames at intervals
+    if step % save_interval == 0 and frames_saved<max_frames:
+        positions_saved.append(X.copy())
+        frames_saved+=1
+        # Minimal progress print
+        if frames_saved%10==0:
+            elapsed = time.time()-start_time
+            print(f"Step={step}, Time={t:.2f}s, Frames={frames_saved}, Elapsed={elapsed:.2f}s, r_top={r_top:.2f}")
+            sys.stdout.flush()
+
 end_time = time.time()
 total_time = end_time - start_time
-print(f"Dynamic integration finished in {total_time:.2f}s total.")
+print(f"Simulation finished in {total_time:.2f}s, steps run={step}, frames={frames_saved}")
 sys.stdout.flush()
 
-positions_saved = positions_saved[:frame_idx,:,:]
+positions_saved = np.array(positions_saved,dtype=np.float64)
 
-print("Rendering PNG frames...")
+print("Generating PNG frames (post-simulation)...")
 sys.stdout.flush()
-for i in range(frame_idx):
-    if i % 10 == 0:
-        print(f"Rendering frame {i}/{frame_idx}")
+
+for i in range(len(positions_saved)):
+    if i % 100 == 0:
+        print(f"Rendering frame {i}/{len(positions_saved)}")
         sys.stdout.flush()
     Xf = positions_saved[i]
     fig, ax = plt.subplots(figsize=(6,6))
@@ -207,14 +233,15 @@ for i in range(frame_idx):
     max_extent = R_mars+L
     ax.set_xlim(-1.2*max_extent,1.2*max_extent)
     ax.set_ylim(-1.2*max_extent,1.2*max_extent)
-    ax.set_title(f"Space Elevator Collapse - Frame {i}, Time={i*save_interval*dt:.2f}s")
-    plt.savefig(f"frames/frame_{i:04d}.png")
+    sim_time = i*save_interval*dt
+    ax.set_title(f"Elevator Collapse - Frame {i}, Time={sim_time:.2f}s")
+    plt.savefig(f"frames/frame_{i:06d}.png")
     plt.close(fig)
 
-print("All PNG frames saved. Creating GIF.")
+print("All PNG frames saved. Creating GIF (5ms per frame).")
 sys.stdout.flush()
 
-png_files = [f"frames/frame_{i:04d}.png" for i in range(frame_idx)]
+png_files = [f"frames/frame_{i:06d}.png" for i in range(len(positions_saved))]
 images = []
 for fname in png_files:
     img = Image.open(fname)
@@ -222,9 +249,8 @@ for fname in png_files:
 
 gif_name = "space_elevator_fall.gif"
 images[0].save(gif_name,
-               save_all=True, append_images=images[1:], duration=0.4, loop=0)
+               save_all=True, append_images=images[1:], duration=5, loop=0)
 
-print(f"GIF saved as {gif_name}, 10x speed.")
+print(f"GIF saved as {gif_name}")
 print(f"Total run time: {total_time:.2f}s")
-print("All done.")
 sys.stdout.flush()
